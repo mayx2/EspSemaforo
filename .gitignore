@@ -1,16 +1,67 @@
-# Pastas de build
+# =========================
+# Build / saída de compilação
+# =========================
 build/
 build-*/
 
-# Configurações do VSCode
+# =========================
+# Firmware gerado
+# =========================
+*.bin
+*.elf
+*.map
+*.hex
+
+# =========================
+# Logs e dumps
+# =========================
+*.log
+core
+core.*
+
+# =========================
+# ESP-IDF - ambiente local
+# =========================
+.idf_py_env/
+managed_components/
+dependencies.lock
+
+# =========================
+# Configurações locais do SDK
+# =========================
+sdkconfig
+sdkconfig.old
+sdkconfig.ci*
+
+# =========================
+# IDE / Editor (local)
+# =========================
 .vscode/
 .devcontainer/
 .clangd
+.idea/
+*.swp
+*.swo
 
-# Arquivos de firmware/compilação
-*.bin
-*.elf
-*.log
+# =========================
+# Arquivos locais / segredos
+# =========================
+secrets.h
+wifi_config.h
+mqtt_config.h
+.env
+.env.*
 
-# Configurações temporárias do SDK
-sdkconfig.ci*
+# =========================
+# Sistema operacional
+# =========================
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# macOS
+.DS_Store
+
+# Linux
+*~

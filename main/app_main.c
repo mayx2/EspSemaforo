@@ -1,19 +1,12 @@
-/* MQTT (over TCP) Example
-
-   This example code is in the Public Domain (or CC0 licensed, at your option.)
-
-   Unless required by applicable law or agreed to in writing, this
-   software is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR
-   CONDITIONS OF ANY KIND, either express or implied.
-*/
-
 #include <stdio.h>
 #include <stdint.h>
 #include <string.h>
+#include <stdlib.h>
+#include <inttypes.h>
+#include <time.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "freertos/event_groups.h"
 
 #include "esp_wifi.h"
 #include "wifi.h"
@@ -21,144 +14,157 @@
 #include "esp_log.h"
 #include "esp_system.h"
 #include "nvs_flash.h"
-
-#include <stdlib.h>
-#include <inttypes.h>
 #include "esp_netif.h"
-#include "protocol_examples_common.h"
-#include "lwip/err.h"
-#include "lwip/sys.h"
 
 #include "mqtt_client.h"
 #include "driver/gpio.h"
-#include "driver/adc.h"
+#include "cJSON.h"
+#include "esp_sntp.h"
 
-static const char *TAG = "mqtt_example";
+static const char *TAG = "semaforo";
 esp_mqtt_client_handle_t global_mqtt_client = NULL;
 
-#define LED_GPIO 21    // pino D23
-#define BUTTON_GPIO 23 // pino D21
+#define LED_GPIO 21
 
-static void log_error_if_nonzero(const char *message, int error_code)
+// Variáveis globais
+int tempoCarroPadrao = 0;
+int tempoPedestrePadrao = 0;
+int tempoCarroPico = 0;
+int tempoPedestrePico = 0;
+int horarioInicioHora = -1;
+int horarioInicioMin = -1;
+int horarioFimHora = -1;
+int horarioFimMin = -1;
+
+// Configuração dos LEDs
+static void configure_leds(void)
 {
-    if (error_code != 0)
+    gpio_reset_pin(21);
+    gpio_set_direction(21, GPIO_MODE_OUTPUT);
+
+    gpio_reset_pin(19);
+    gpio_set_direction(19, GPIO_MODE_OUTPUT);
+
+    gpio_reset_pin(18);
+    gpio_set_direction(18, GPIO_MODE_OUTPUT);
+}
+
+void led_verde(bool on) { gpio_set_level(21, on ? 1 : 0); }
+void led_amarelo(bool on) { gpio_set_level(19, on ? 1 : 0); }
+void led_vermelho(bool on) { gpio_set_level(18, on ? 1 : 0); }
+
+void init_sntp(void)
+{
+    ESP_LOGI(TAG, "Inicializando SNTP");
+    sntp_setoperatingmode(SNTP_OPMODE_POLL);
+    sntp_setservername(0, "pool.ntp.org");
+    sntp_init();
+}
+bool isHorarioPico(struct tm *timeinfo)
+{
+    int horaAtual = timeinfo->tm_hour;
+    int minutoAtual = timeinfo->tm_min;
+
+    int atualMinutos = horaAtual * 60 + minutoAtual;
+    int inicioMinutos = horarioInicioHora * 60 + horarioInicioMin;
+    int fimMinutos = horarioFimHora * 60 + horarioFimMin;
+
+    ESP_LOGI(TAG, "DEBUG Horario atual: %02d:%02d (%d min)", horaAtual, minutoAtual, atualMinutos);
+    ESP_LOGI(TAG, "DEBUG Intervalo pico: inicio=%02d:%02d (%d min) fim=%02d:%02d (%d min)",
+             horarioInicioHora, horarioInicioMin, inicioMinutos,
+             horarioFimHora, horarioFimMin, fimMinutos);
+
+    // Caso o horário de pico não atravesse a meia-noite
+    if (inicioMinutos <= fimMinutos)
     {
-        ESP_LOGE(TAG, "Last error %s: 0x%x", message, error_code);
+        return (atualMinutos >= inicioMinutos && atualMinutos <= fimMinutos);
+    }
+    // Caso o horário de pico atravesse a meia-noite
+    else
+    {
+        return (atualMinutos >= inicioMinutos || atualMinutos <= fimMinutos);
     }
 }
 
-static void configure_led(void)
+
+void print_time(void)
 {
-    ESP_LOGI(TAG, "Example configured to blink GPIO LED!");
-    gpio_reset_pin(LED_GPIO);
-    gpio_reset_pin(BUTTON_GPIO);
-    gpio_set_direction(LED_GPIO, GPIO_MODE_OUTPUT);
-    gpio_set_direction(BUTTON_GPIO, GPIO_MODE_INPUT);
-    gpio_set_pull_mode(BUTTON_GPIO, GPIO_PULLUP_ONLY); // Define que é um método de pull-up
-}
-void led_set_state(bool on)
-{
-    gpio_set_level(LED_GPIO, on ? 1 : 0);
-}
+    time_t now;
+    struct tm timeinfo;
+    time(&now);
+    localtime_r(&now, &timeinfo);
 
-static void botao_task(void *parameter) {
-    int valor_anterior = 2;
-    while(1) {
-        int estadoBotao = gpio_get_level(BUTTON_GPIO);
-
-        if(estadoBotao != valor_anterior && global_mqtt_client != NULL) {
-            valor_anterior = estadoBotao;
-            esp_mqtt_client_publish(global_mqtt_client,
-                                    "Esp1/Botao",
-                                    (estadoBotao == 0) ? "0" : "1",
-                                    0, 1, 1); 
-
-            ESP_LOGI("BUTTON", "Botão = %d enviado ao broker", estadoBotao);
-        }
-
-        vTaskDelay(1);
-    }
+    ESP_LOGI(TAG, "Data/Hora atual: %02d/%02d/%04d %02d:%02d:%02d",
+             timeinfo.tm_mday,
+             timeinfo.tm_mon + 1,
+             timeinfo.tm_year + 1900,
+             timeinfo.tm_hour,
+             timeinfo.tm_min,
+             timeinfo.tm_sec);
 }
 
-/*
- * @brief Event handler registered to receive MQTT events
- *
- *  This function is called by the MQTT client event loop.
- *
- * @param handler_args user data registered to the event.
- * @param base Event base for the handler(always MQTT Base in this example).
- * @param event_id The id for the received event.
- * @param event_data The data for the event, esp_mqtt_event_handle_t.
- */
+// MQTT handler
 static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data)
 {
-    ESP_LOGD(TAG, "Event dispatched from event loop base=%s, event_id=%" PRIi32 "", base, event_id);
     esp_mqtt_event_handle_t event = event_data;
     esp_mqtt_client_handle_t client = event->client;
-    int msg_id;
+
     switch ((esp_mqtt_event_id_t)event_id)
     {
     case MQTT_EVENT_CONNECTED:
-        ESP_LOGI(TAG, "MQTT_EVENT_CONNECTED");
-
-        msg_id = esp_mqtt_client_subscribe(client, "Esp2/Botao", 0);
-        ESP_LOGI(TAG, "sent subscribe successful, msg_id=%d", msg_id);
-        break;
-    case MQTT_EVENT_DISCONNECTED:
-        ESP_LOGI(TAG, "MQTT_EVENT_DISCONNECTED");
+        ESP_LOGI(TAG, "MQTT conectado!");
+        esp_mqtt_client_subscribe(client, "Ifpe/Semaforo/Semaforo1", 0);
         break;
 
-    case MQTT_EVENT_SUBSCRIBED:
-        ESP_LOGI(TAG, "MQTT_EVENT_SUBSCRIBED, msg_id=%d", event->msg_id);
-        break;
-    case MQTT_EVENT_UNSUBSCRIBED:
-        ESP_LOGI(TAG, "MQTT_EVENT_UNSUBSCRIBED, msg_id=%d", event->msg_id);
-        break;
-    case MQTT_EVENT_PUBLISHED:
-        ESP_LOGI(TAG, "MQTT_EVENT_PUBLISHED, msg_id=%d", event->msg_id);
-        break;
     case MQTT_EVENT_DATA:
+    {
         ESP_LOGI(TAG, "MQTT_EVENT_DATA");
+        char *payload = strndup(event->data, event->data_len);
+        ESP_LOGI(TAG, "Recebido: %s", payload);
 
-        printf("TOPIC=%.*s\r\n", event->topic_len, event->topic);
-        printf("DATA=%.*s\r\n", event->data_len, event->data);
-
-        if (strncmp(event->topic, "Esp2/Botao", event->topic_len) == 0)
+        cJSON *json = cJSON_Parse(payload);
+        if (json)
         {
-            if (event->data_len > 0)
+            cJSON *tempoPadrao = cJSON_GetObjectItem(json, "tempoPadrao");
+            if (tempoPadrao)
             {
-                char valor = event->data[0];
-
-                if (valor == '0')
-                {
-                    led_set_state(true);
-                    ESP_LOGI(TAG, "LED LIGADO");
-                }
-                else if (valor == '1')
-                {
-                    led_set_state(false);
-                    ESP_LOGI(TAG, "LED DESLIGADO");
-                }
+                tempoCarroPadrao = cJSON_GetObjectItem(tempoPadrao, "carro")->valueint;
+                tempoPedestrePadrao = cJSON_GetObjectItem(tempoPadrao, "pedestre")->valueint;
             }
-        }
-        break;
 
-    case MQTT_EVENT_ERROR:
-        ESP_LOGI(TAG, "MQTT_EVENT_ERROR");
-        if (event->error_handle->error_type == MQTT_ERROR_TYPE_TCP_TRANSPORT)
-        {
-            log_error_if_nonzero("reported from esp-tls", event->error_handle->esp_tls_last_esp_err);
-            log_error_if_nonzero("reported from tls stack", event->error_handle->esp_tls_stack_err);
-            log_error_if_nonzero("captured as transport's socket errno", event->error_handle->esp_transport_sock_errno);
-            ESP_LOGI(TAG, "Last errno string (%s)", strerror(event->error_handle->esp_transport_sock_errno));
+            cJSON *tempoHorarioPico = cJSON_GetObjectItem(json, "tempoHorarioPico");
+            if (tempoHorarioPico)
+            {
+                tempoCarroPico = cJSON_GetObjectItem(tempoHorarioPico, "carro")->valueint;
+                tempoPedestrePico = cJSON_GetObjectItem(tempoHorarioPico, "pedestre")->valueint;
+            }
+
+            cJSON *horarioPico = cJSON_GetObjectItem(json, "horarioPico");
+            if (horarioPico)
+            {
+                const char *inicioStr = cJSON_GetObjectItem(horarioPico, "inicio")->valuestring;
+                const char *fimStr = cJSON_GetObjectItem(horarioPico, "fim")->valuestring;
+
+                sscanf(inicioStr, "%d:%d", &horarioInicioHora, &horarioInicioMin);
+                sscanf(fimStr, "%d:%d", &horarioFimHora, &horarioFimMin);
+
+                ESP_LOGI(TAG, "Horario Pico: inicio %02d:%02d fim %02d:%02d",
+                         horarioInicioHora, horarioInicioMin,
+                         horarioFimHora, horarioFimMin);
+            }
+
+            cJSON_Delete(json);
         }
+        free(payload);
         break;
+    }
+
     default:
-        ESP_LOGI(TAG, "Other event id:%d", event->event_id);
         break;
     }
 }
 
+// Inicializa MQTT
 static void mqtt_start(void)
 {
     esp_mqtt_client_config_t mqtt_cfg = {
@@ -168,46 +174,99 @@ static void mqtt_start(void)
     esp_mqtt_client_start(global_mqtt_client);
 }
 
+static void publicar_estado(const char *estado, int segundos) {
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddStringToObject(root, "estadoAtual", estado);
+    cJSON_AddNumberToObject(root, "segundos", segundos);
+    char *json_str = cJSON_PrintUnformatted(root);
+
+    esp_mqtt_client_publish(global_mqtt_client,
+        "Ifpe/Semaforo/Semaforo1/estadoAtual",
+        json_str, 0, 1, 0);
+
+    cJSON_Delete(root);
+    free(json_str);
+}
+
+// Task principal do semáforo
+static void semaforo_task(void *parameter)
+{
+    while (1)
+    {
+        if (tempoCarroPadrao > 0 && tempoPedestrePadrao > 0 &&
+            tempoCarroPico > 0 && tempoPedestrePico > 0 &&
+            horarioInicioHora >= 0 && horarioFimHora >= 0)
+        {
+
+            time_t now;
+            struct tm timeinfo;
+            time(&now);
+            localtime_r(&now, &timeinfo);
+
+            bool pico = isHorarioPico(&timeinfo);
+
+            int tempoCarro = pico ? tempoCarroPico : tempoCarroPadrao;
+            int tempoPedestre = pico ? tempoPedestrePico : tempoPedestrePadrao;
+
+            ESP_LOGI(TAG, "Modo escolhido: %s", pico ? "HORARIO DE PICO" : "PADRAO");
+
+            // Verde (carros)
+            led_verde(true);
+            led_amarelo(false);
+            led_vermelho(false);
+            ESP_LOGI(TAG, "Verde por %d segundos", tempoCarro);
+            publicar_estado("verde", tempoCarro);
+            vTaskDelay(pdMS_TO_TICKS(tempoCarro * 1000));
+
+            // Amarelo (transição) - 5 segundos
+            led_verde(false);
+            led_amarelo(true);
+            led_vermelho(false);
+            ESP_LOGI(TAG, "Amarelo por 5 segundos");
+            publicar_estado("amarelo", 5);
+            vTaskDelay(pdMS_TO_TICKS(5000));
+
+            // Vermelho (pedestres)
+            led_verde(false);
+            led_amarelo(false);
+            led_vermelho(true);
+            ESP_LOGI(TAG, "Vermelho por %d segundos", tempoPedestre);
+            publicar_estado("vermelho", tempoPedestre);
+            vTaskDelay(pdMS_TO_TICKS(tempoPedestre * 1000));
+        }
+        else
+        {
+            ESP_LOGW(TAG, "Ainda não recebeu dados do semáforo via MQTT...");
+            vTaskDelay(pdMS_TO_TICKS(2000));
+        }
+    }
+}
+
 void app_main(void)
 {
-    ESP_LOGI(TAG, "[APP] Startup..");
-    ESP_LOGI(TAG, "[APP] Free memory: %" PRIu32 " bytes", esp_get_free_heap_size());
-    ESP_LOGI(TAG, "[APP] IDF version: %s", esp_get_idf_version());
-
-    esp_log_level_set("*", ESP_LOG_INFO);
-    esp_log_level_set("mqtt_client", ESP_LOG_VERBOSE);
-    esp_log_level_set("mqtt_example", ESP_LOG_VERBOSE);
-    esp_log_level_set("transport_base", ESP_LOG_VERBOSE);
-    esp_log_level_set("esp-tls", ESP_LOG_VERBOSE);
-    esp_log_level_set("transport", ESP_LOG_VERBOSE);
-    esp_log_level_set("outbox", ESP_LOG_VERBOSE);
-
     ESP_ERROR_CHECK(nvs_flash_init());
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
 
-    /* This helper function configures Wi-Fi or Ethernet, as selected in menuconfig.
-     * Read "Establishing Wi-Fi or Ethernet Connection" section in
-     * examples/protocols/README.md for more information about this function.
-     */
-    ESP_LOGI(TAG, "[APP] Inicializando Wi-Fi...");
-    wifi_init_sta(); //
-
-    ESP_LOGI(TAG, "[APP] Configurando GPIOs...");
-    configure_led();
-
-    ESP_LOGI(TAG, "[APP] Iniciando MQTT...");
+    wifi_init_sta();
+    init_sntp();
+    configure_leds();
     mqtt_start();
 
-    xTaskCreate(botao_task,
-                "BotaoTask",
-                2048,
-                NULL,
-                5,
-                NULL);
-
-    while (1)
+    // sincronização SNTP
+    time_t now = 0;
+    struct tm timeinfo = {0};
+    int retry = 0;
+    const int retry_count = 10;
+    while (timeinfo.tm_year < (2016 - 1900) && ++retry < retry_count)
     {
-        vTaskDelay(pdMS_TO_TICKS(100));
+        ESP_LOGI(TAG, "Aguardando sincronização do tempo... (%d/%d)", retry, retry_count);
+        vTaskDelay(2000 / portTICK_PERIOD_MS);
+        time(&now);
+        localtime_r(&now, &timeinfo);
     }
+    setenv("TZ", "BRT3", 1);
+    tzset();
+
+    xTaskCreate(semaforo_task, "SemaforoTask", 4096, NULL, 5, NULL);
 }
