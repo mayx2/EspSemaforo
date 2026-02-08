@@ -24,9 +24,12 @@
 static const char *TAG = "semaforo";
 esp_mqtt_client_handle_t global_mqtt_client = NULL;
 
-#define LED_GPIO 21
+#define LED_VERDE   21
+#define LED_AMARELO 19
+#define LED_VERMELHO 18
+#define BOTAO_GPIO  23
 
-// Variáveis globais
+
 int tempoCarroPadrao = 0;
 int tempoPedestrePadrao = 0;
 int tempoCarroPico = 0;
@@ -35,23 +38,31 @@ int horarioInicioHora = -1;
 int horarioInicioMin = -1;
 int horarioFimHora = -1;
 int horarioFimMin = -1;
+volatile int estado_atual = 0;
+volatile bool pedestre_pediu = false;
 
-// Configuração dos LEDs
-static void configure_leds(void)
+static void configure_button(void)
 {
-    gpio_reset_pin(21);
-    gpio_set_direction(21, GPIO_MODE_OUTPUT);
-
-    gpio_reset_pin(19);
-    gpio_set_direction(19, GPIO_MODE_OUTPUT);
-
-    gpio_reset_pin(18);
-    gpio_set_direction(18, GPIO_MODE_OUTPUT);
+    gpio_reset_pin(BOTAO_GPIO);
+    gpio_set_direction(BOTAO_GPIO, GPIO_MODE_INPUT);
+    gpio_set_pull_mode(BOTAO_GPIO, GPIO_PULLUP_ONLY);
 }
 
-void led_verde(bool on) { gpio_set_level(21, on ? 1 : 0); }
-void led_amarelo(bool on) { gpio_set_level(19, on ? 1 : 0); }
-void led_vermelho(bool on) { gpio_set_level(18, on ? 1 : 0); }
+
+static void configure_leds(void)
+{
+    gpio_reset_pin(LED_VERDE);
+    gpio_set_direction(LED_VERDE, GPIO_MODE_OUTPUT);
+
+    gpio_reset_pin(LED_AMARELO);
+    gpio_set_direction(LED_AMARELO, GPIO_MODE_OUTPUT);
+
+    gpio_reset_pin(LED_VERMELHO);
+    gpio_set_direction(LED_VERMELHO, GPIO_MODE_OUTPUT);
+}
+void led_verde(bool on)   { gpio_set_level(LED_VERDE, on ? 1 : 0); }
+void led_amarelo(bool on) { gpio_set_level(LED_AMARELO, on ? 1 : 0); }
+void led_vermelho(bool on){ gpio_set_level(LED_VERMELHO, on ? 1 : 0); }
 
 void init_sntp(void)
 {
@@ -74,18 +85,17 @@ bool isHorarioPico(struct tm *timeinfo)
              horarioInicioHora, horarioInicioMin, inicioMinutos,
              horarioFimHora, horarioFimMin, fimMinutos);
 
-    // Caso o horário de pico não atravesse a meia-noite
+    
     if (inicioMinutos <= fimMinutos)
     {
         return (atualMinutos >= inicioMinutos && atualMinutos <= fimMinutos);
     }
-    // Caso o horário de pico atravesse a meia-noite
+   
     else
     {
         return (atualMinutos >= inicioMinutos || atualMinutos <= fimMinutos);
     }
 }
-
 
 void print_time(void)
 {
@@ -103,7 +113,7 @@ void print_time(void)
              timeinfo.tm_sec);
 }
 
-// MQTT handler
+// MQTT 
 static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data)
 {
     esp_mqtt_event_handle_t event = event_data;
@@ -164,7 +174,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
     }
 }
 
-// Inicializa MQTT
+
 static void mqtt_start(void)
 {
     esp_mqtt_client_config_t mqtt_cfg = {
@@ -174,21 +184,46 @@ static void mqtt_start(void)
     esp_mqtt_client_start(global_mqtt_client);
 }
 
-static void publicar_estado(const char *estado, int segundos) {
+static void publicar_estado(const char *estado, int segundos)
+{
     cJSON *root = cJSON_CreateObject();
     cJSON_AddStringToObject(root, "estadoAtual", estado);
     cJSON_AddNumberToObject(root, "segundos", segundos);
     char *json_str = cJSON_PrintUnformatted(root);
 
     esp_mqtt_client_publish(global_mqtt_client,
-        "Ifpe/Semaforo/Semaforo1/estadoAtual",
-        json_str, 0, 1, 0);
+                            "Ifpe/Semaforo/Semaforo1/estadoAtual",
+                            json_str, 0, 1, 0);
 
     cJSON_Delete(root);
     free(json_str);
 }
+void esperar_com_interrupcao(int segundos)
+{
+    for (int i = 0; i < segundos; i++)
+    {
+        if (pedestre_pediu)
+        {
+            break;
+        }
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+}
+static void botao_task(void *parameter)
+{
+    while (1)
+    {
+        if (gpio_get_level(BOTAO_GPIO) == 0 && estado_atual == 0) 
+        {
+            pedestre_pediu = true;
+            ESP_LOGI(TAG, "Botão do pedestre pressionado durante verde!");
+            vTaskDelay(pdMS_TO_TICKS(500)); 
+        }
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+}
 
-// Task principal do semáforo
+// Task do semáforo
 static void semaforo_task(void *parameter)
 {
     while (1)
@@ -197,40 +232,64 @@ static void semaforo_task(void *parameter)
             tempoCarroPico > 0 && tempoPedestrePico > 0 &&
             horarioInicioHora >= 0 && horarioFimHora >= 0)
         {
-
             time_t now;
             struct tm timeinfo;
             time(&now);
             localtime_r(&now, &timeinfo);
 
             bool pico = isHorarioPico(&timeinfo);
-
             int tempoCarro = pico ? tempoCarroPico : tempoCarroPadrao;
             int tempoPedestre = pico ? tempoPedestrePico : tempoPedestrePadrao;
 
-            ESP_LOGI(TAG, "Modo escolhido: %s", pico ? "HORARIO DE PICO" : "PADRAO");
-
-            // Verde (carros)
+            // Verde
+            estado_atual = 0;
             led_verde(true);
             led_amarelo(false);
             led_vermelho(false);
-            ESP_LOGI(TAG, "Verde por %d segundos", tempoCarro);
             publicar_estado("verde", tempoCarro);
-            vTaskDelay(pdMS_TO_TICKS(tempoCarro * 1000));
+            esperar_com_interrupcao(tempoCarro);
 
-            // Amarelo (transição) - 5 segundos
+            if (pedestre_pediu)
+            {
+                pedestre_pediu = false;
+
+                // Sequência pedestre
+                led_verde(true);
+                led_amarelo(false);
+                led_vermelho(false);
+                publicar_estado("verde", 2);
+                vTaskDelay(pdMS_TO_TICKS(2000));
+
+                estado_atual = 1;
+                led_verde(false);
+                led_amarelo(true);
+                led_vermelho(false);
+                publicar_estado("amarelo", 4);
+                vTaskDelay(pdMS_TO_TICKS(5000));
+
+                estado_atual = 2;
+                led_verde(false);
+                led_amarelo(false);
+                led_vermelho(true);
+                publicar_estado("vermelho", tempoPedestre);
+                vTaskDelay(pdMS_TO_TICKS(tempoPedestre * 1000));
+
+                continue;
+            }
+
+            // (fluxo normal)
+            estado_atual = 1;
             led_verde(false);
             led_amarelo(true);
             led_vermelho(false);
-            ESP_LOGI(TAG, "Amarelo por 5 segundos");
             publicar_estado("amarelo", 5);
             vTaskDelay(pdMS_TO_TICKS(5000));
 
-            // Vermelho (pedestres)
+            
+            estado_atual = 2;
             led_verde(false);
             led_amarelo(false);
             led_vermelho(true);
-            ESP_LOGI(TAG, "Vermelho por %d segundos", tempoPedestre);
             publicar_estado("vermelho", tempoPedestre);
             vTaskDelay(pdMS_TO_TICKS(tempoPedestre * 1000));
         }
@@ -241,19 +300,26 @@ static void semaforo_task(void *parameter)
         }
     }
 }
-
 void app_main(void)
 {
     ESP_ERROR_CHECK(nvs_flash_init());
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
 
+    // Inicializa Wi-Fi
     wifi_init_sta();
+
+    // Inicializa SNTP
     init_sntp();
+
+    // Configura LEDs e botão
     configure_leds();
+    configure_button();
+
+    // Inicia MQTT
     mqtt_start();
 
-    // sincronização SNTP
+    // Sincronização SNTP
     time_t now = 0;
     struct tm timeinfo = {0};
     int retry = 0;
@@ -268,5 +334,7 @@ void app_main(void)
     setenv("TZ", "BRT3", 1);
     tzset();
 
+    // Cria tasks
     xTaskCreate(semaforo_task, "SemaforoTask", 4096, NULL, 5, NULL);
+    xTaskCreate(botao_task, "BotaoTask", 2048, NULL, 5, NULL);
 }

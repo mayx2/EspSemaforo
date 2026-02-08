@@ -13,8 +13,8 @@
 #include "lwip/sys.h"
 
 // ===================== Configurações Wi-Fi =====================
-#define ESP_WIFI_SSID "internet_60"
-#define ESP_WIFI_PASS "senha1234"
+#define ESP_WIFI_SSID "POCO X5 PRO"
+#define ESP_WIFI_PASS "12345678"
 #define ESP_MAXIMUM_RETRY 5
 #define ESP_WIFI_SCAN_AUTH_MODE_THRESHOLD WIFI_AUTH_WPA2_PSK
 
